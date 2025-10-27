@@ -30,6 +30,7 @@ urlpatterns = [
     path('api/validate_step/', views.validate_step, name='validate_step'),  # Updated: Moved to api/
     path('privacy_policy/', views.privacy_policy, name='privacy_policy'),
     path('api/routes/', views.routes_api, name='routes_api'),
+    path('api/homepage-schedules/', views.homepage_schedules_api, name='homepage_schedules_api'),
     path('api/weather/conditions/', views.get_weather_conditions, name='get_weather_conditions'),  # Updated: More specific path
     path('api/create_checkout_session/', views.create_checkout_session, name='api_create_checkout_session'), # Updated: Moved to api/
     path('api/check_session/', views.check_session, name='check_session'),  # Updated: Moved to api/

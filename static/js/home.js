@@ -17,7 +17,7 @@
         animationDuration: 600,
         slideshowInterval: 5000,
         testimonialInterval: 7000,
-        pollingInterval: 120000,
+        pollingInterval: 60000,
         weatherUpdateInterval: 120000, // Poll DB every 2 min
         debug: true
     };
@@ -700,30 +700,579 @@
 // === SCHEDULE MANAGER – PER-SCHEDULE DB POLLING ===
 class ScheduleManager {
     constructor() {
+        this.scheduleList = null;
+        this.nextDepartureBanner = document.querySelector('.next-departure-banner');
+        this.viewAllButton = document.getElementById('view-all-btn');
+        this.weatherTimer = null;
+        this.scheduleTimer = null;
+        this.latestHash = null;
+        this.maxSchedules = 12;
+        this.visibleScheduleIds = new Set();
         this.init();
     }
 
     init() {
+        this.scheduleList = this.ensureScheduleList();
+        if (this.scheduleList) {
+            this.maxSchedules = parseInt(this.scheduleList.dataset.limit || '12', 10);
+            this.visibleScheduleIds = new Set(
+                Array.from(this.scheduleList.querySelectorAll('.schedule-card'))
+                    .map(card => parseInt(card.dataset.scheduleId, 10))
+                    .filter(id => !Number.isNaN(id))
+            );
+        }
+
         this.updateWeatherDisplay();
-        setInterval(() => this.updateWeatherDisplay(), FijiFerry.config.weatherUpdateInterval);
+        this.weatherTimer = setInterval(() => this.updateWeatherDisplay(), FijiFerry.config.weatherUpdateInterval);
+        this.startSchedulePolling();
+    }
+
+    destroy() {
+        if (this.weatherTimer) clearInterval(this.weatherTimer);
+        if (this.scheduleTimer) clearInterval(this.scheduleTimer);
+    }
+
+    ensureScheduleList() {
+        if (this.scheduleList) return this.scheduleList;
+        const existing = document.getElementById('schedule-list');
+        if (existing) {
+            return existing;
+        }
+
+        const container = document.querySelector('#schedules-section .container');
+        if (!container) return null;
+
+        const list = document.createElement('div');
+        list.id = 'schedule-list';
+        list.className = 'schedule-list grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6';
+        list.setAttribute('role', 'list');
+        list.setAttribute('aria-label', 'Available ferry schedules');
+        list.dataset.limit = '12';
+
+        const loadMore = container.querySelector('.load-more');
+        if (loadMore) {
+            container.insertBefore(list, loadMore);
+        } else {
+            container.appendChild(list);
+        }
+
+        return list;
+    }
+
+    startSchedulePolling() {
+        this.fetchAndRenderSchedules(true);
+        this.scheduleTimer = setInterval(() => this.fetchAndRenderSchedules(), FijiFerry.config.pollingInterval);
+    }
+
+    async fetchAndRenderSchedules(force = false) {
+        const endpoint = window.urls?.homeSchedules || '/bookings/api/homepage-schedules/';
+        try {
+            const url = new URL(endpoint, window.location.origin);
+            url.searchParams.set('limit', (this.maxSchedules || 12).toString());
+            url.searchParams.set('_', Date.now().toString());
+
+            const response = await fetch(url.toString(), {
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json'
+                },
+                credentials: 'same-origin'
+            });
+
+            if (!response.ok) {
+                throw new Error(`Schedule fetch failed with status ${response.status}`);
+            }
+
+            const data = await response.json();
+            this.renderNextDeparture(data.next_departure);
+            this.updateCounts(data.total_schedules, data.remaining_schedules);
+
+            const hasChanged = force || (data.schedules_hash && data.schedules_hash !== this.latestHash);
+            if (!hasChanged) {
+                logger.log('Schedules unchanged; skipping re-render');
+                return;
+            }
+
+            this.latestHash = data.schedules_hash || null;
+            this.renderScheduleList(data.schedules || [], force);
+            await this.updateWeatherDisplay();
+        } catch (error) {
+            logger.warn('Schedule polling failed:', error);
+        }
+    }
+
+    renderNextDeparture(nextDeparture) {
+        if (!this.nextDepartureBanner) {
+            this.nextDepartureBanner = document.querySelector('.next-departure-banner');
+        }
+        if (!this.nextDepartureBanner) return;
+
+        const timeEl = this.nextDepartureBanner.querySelector('#next-departure-time');
+        if (timeEl) {
+            if (nextDeparture) {
+                timeEl.textContent = `${nextDeparture.time_display} - ${nextDeparture.route_display}`;
+                timeEl.setAttribute('datetime', nextDeparture.departure_time);
+            } else {
+                timeEl.textContent = 'No upcoming departures available';
+                timeEl.removeAttribute('datetime');
+            }
+        }
+
+        const cta = this.nextDepartureBanner.querySelector('.banner-cta');
+        if (cta) {
+            if (nextDeparture?.book_url) {
+                cta.href = nextDeparture.book_url;
+                cta.setAttribute('aria-label', `Book the next departure from ${nextDeparture.route_display}`);
+                cta.classList.remove('pointer-events-none', 'opacity-50');
+                cta.removeAttribute('aria-disabled');
+            } else {
+                cta.removeAttribute('href');
+                cta.setAttribute('aria-disabled', 'true');
+                cta.classList.add('pointer-events-none', 'opacity-50');
+            }
+        }
+    }
+
+    updateCounts(total, remaining) {
+        const totalSchedules = Number.isFinite(total) ? total : 0;
+        const remainingSchedules = Number.isFinite(remaining) ? remaining : 0;
+
+        const viewAllBtn = this.viewAllButton || document.getElementById('view-all-btn');
+        if (viewAllBtn) {
+            const labelSpan = viewAllBtn.querySelector('span');
+            if (labelSpan) {
+                labelSpan.textContent = `View All (${totalSchedules})`;
+            }
+            viewAllBtn.setAttribute('aria-label', `View all ${totalSchedules} available schedules`);
+        }
+
+        const loadMoreBtn = document.getElementById('load-more-schedules');
+        const loadMoreWrapper = loadMoreBtn ? loadMoreBtn.closest('.load-more') : null;
+        if (loadMoreBtn && loadMoreWrapper) {
+            if (remainingSchedules > 0) {
+                loadMoreWrapper.classList.remove('hidden');
+                const textSpan = loadMoreBtn.querySelector('span');
+                if (textSpan) {
+                    textSpan.textContent = `Load More Schedules (${remainingSchedules} remaining)`;
+                }
+                loadMoreBtn.setAttribute('aria-label', `Load ${remainingSchedules} more schedules`);
+            } else {
+                loadMoreWrapper.classList.add('hidden');
+            }
+        }
+    }
+
+    renderScheduleList(schedules, suppressHighlight = false) {
+        this.scheduleList = this.ensureScheduleList();
+        const list = this.scheduleList;
+        if (!list) return;
+
+        const previousIds = new Set(this.visibleScheduleIds);
+        list.innerHTML = '';
+
+        if (!schedules || schedules.length === 0) {
+            list.appendChild(this.buildEmptyState());
+            this.visibleScheduleIds.clear();
+            return;
+        }
+
+        const fragment = document.createDocumentFragment();
+        const newIdSet = new Set();
+
+        for (const schedule of schedules) {
+            fragment.appendChild(this.createScheduleCard(schedule));
+            newIdSet.add(schedule.id);
+        }
+
+        list.appendChild(fragment);
+        this.visibleScheduleIds = newIdSet;
+
+        if (!suppressHighlight) {
+            const addedIds = [...newIdSet].filter(id => !previousIds.has(id));
+            if (addedIds.length) {
+                this.highlightNewSchedules(addedIds);
+            }
+        }
+    }
+
+    buildEmptyState() {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'col-span-full text-center py-16';
+
+        const container = document.createElement('div');
+        container.className = 'empty-state';
+
+        const icon = document.createElement('i');
+        icon.className = 'fas fa-ship text-6xl text-gray-300 mb-6';
+        icon.setAttribute('aria-hidden', 'true');
+
+        const heading = document.createElement('h3');
+        heading.className = 'text-2xl font-semibold text-gray-700 mb-2 font-poppins';
+        heading.textContent = 'No Departures Available';
+
+        const description = document.createElement('p');
+        description.className = 'text-gray-600 mb-6 max-w-md mx-auto leading-relaxed';
+        description.textContent = 'No current departures available. Please check back soon or try a different route.';
+
+        const actions = document.createElement('div');
+        actions.className = 'empty-state-actions flex flex-wrap justify-center gap-4';
+
+        const resetButton = document.createElement('button');
+        resetButton.type = 'button';
+        resetButton.className = 'reset-btn bg-emerald-100 hover:bg-emerald-200 text-emerald-700 px-6 py-3 rounded-lg font-medium transition-all flex items-center gap-2 shadow-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50';
+        resetButton.setAttribute('aria-label', 'Reset search filters');
+        resetButton.addEventListener('click', () => window.resetSearch?.());
+
+        const resetIcon = document.createElement('i');
+        resetIcon.className = 'fas fa-sync-alt';
+        resetIcon.setAttribute('aria-hidden', 'true');
+
+        const resetText = document.createElement('span');
+        resetText.textContent = 'Reset Search';
+
+        resetButton.append(resetIcon, resetText);
+
+        const browseLink = document.createElement('a');
+        browseLink.className = 'browse-btn bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-600 hover:to-cyan-600 text-white px-6 py-3 rounded-lg font-medium shadow-lg hover:shadow-xl transition-all flex items-center gap-2 focus:outline-none focus:ring-2 focus:ring-emerald-500/50';
+        browseLink.href = this.getBookingUrl({ id: '', book_url: window.urls?.bookTicket || '/bookings/book/' });
+        browseLink.setAttribute('aria-label', 'Browse all available routes');
+
+        const browseIcon = document.createElement('i');
+        browseIcon.className = 'fas fa-compass';
+        browseIcon.setAttribute('aria-hidden', 'true');
+
+        const browseText = document.createElement('span');
+        browseText.textContent = 'Browse All Routes';
+
+        browseLink.append(browseIcon, browseText);
+
+        actions.append(resetButton, browseLink);
+        container.append(icon, heading, description, actions);
+        wrapper.appendChild(container);
+
+        return wrapper;
+    }
+
+    createScheduleCard(schedule) {
+        const card = document.createElement('article');
+        card.className = 'schedule-card transition-all duration-300 hover:shadow-lg hover:-translate-y-1 border border-gray-200 rounded-xl overflow-hidden flex flex-col h-full';
+        card.dataset.scheduleId = schedule.id;
+        if (schedule.route?.id) card.dataset.routeId = schedule.route.id;
+        if (schedule.departure_hour) card.dataset.timeSlot = schedule.departure_hour;
+        if (typeof schedule.route?.base_fare !== 'undefined') {
+            card.dataset.price = schedule.route.base_fare ?? 0;
+        }
+        card.setAttribute('role', 'article');
+        card.setAttribute('aria-labelledby', `schedule-${schedule.id}-title`);
+
+        const routeInfo = document.createElement('div');
+        routeInfo.className = 'route-info p-6 flex-grow';
+
+        const header = document.createElement('header');
+        header.className = 'mb-4';
+
+        const title = document.createElement('h3');
+        title.id = `schedule-${schedule.id}-title`;
+        title.className = 'text-xl font-bold text-gray-800 font-poppins mb-2';
+        title.appendChild(document.createTextNode(`${schedule.route?.departure || ''} `));
+        const arrow = document.createElement('span');
+        arrow.className = 'text-sm text-gray-400';
+        arrow.setAttribute('aria-hidden', 'true');
+        arrow.textContent = '→';
+        title.appendChild(arrow);
+        title.appendChild(document.createTextNode(` ${schedule.route?.destination || ''}`));
+
+        const timeEl = document.createElement('time');
+        timeEl.className = 'departure-time text-sm text-gray-600 mb-1';
+        if (schedule.departure_time) timeEl.setAttribute('datetime', schedule.departure_time);
+        timeEl.setAttribute('aria-label', 'Departure time');
+        timeEl.textContent = schedule.departure_display || '';
+
+        const ferryName = document.createElement('p');
+        ferryName.className = 'ferry-name text-sm text-gray-500';
+        ferryName.textContent = schedule.ferry_name || '';
+
+        header.append(title, timeEl, ferryName);
+
+        const weatherInfo = document.createElement('div');
+        weatherInfo.className = 'weather-info flex items-center gap-3 p-3 bg-gray-50 rounded-lg mb-4 border border-gray-100';
+        weatherInfo.setAttribute('aria-label', 'Weather forecast for departure');
+
+        const weatherIcon = document.createElement('div');
+        weatherIcon.className = 'weather-icon text-2xl flex-shrink-0';
+        weatherIcon.id = `weather-icon-${schedule.id}`;
+        weatherIcon.textContent = '🌤️';
+
+        const weatherDetails = document.createElement('div');
+        weatherDetails.className = 'weather-details flex-1 min-w-0';
+
+        const weatherCondition = document.createElement('div');
+        weatherCondition.className = 'weather-condition font-semibold text-sm text-gray-800 truncate';
+        weatherCondition.id = `weather-condition-${schedule.id}`;
+        weatherCondition.setAttribute('role', 'status');
+        weatherCondition.setAttribute('aria-live', 'polite');
+        weatherCondition.textContent = 'Loading weather...';
+
+        const weatherMeta = document.createElement('div');
+        weatherMeta.className = 'weather-meta flex gap-4 text-xs text-gray-500 mt-1 flex-wrap';
+
+        weatherMeta.append(
+            this.createWeatherMetricElement('temp', schedule.id, 'fas fa-thermometer-half text-emerald-500', '28°C', 'Temperature'),
+            this.createWeatherMetricElement('wind', schedule.id, 'fas fa-wind text-blue-500', '12 kph', 'Wind speed'),
+            this.createWeatherMetricElement('precip', schedule.id, 'fas fa-cloud-rain text-gray-500', '5%', 'Precipitation chance')
+        );
+
+        weatherDetails.append(weatherCondition, weatherMeta);
+        weatherInfo.append(weatherIcon, weatherDetails);
+
+        const scheduleMeta = document.createElement('dl');
+        scheduleMeta.className = 'schedule-meta grid grid-cols-2 gap-3 mb-4 text-sm text-gray-600';
+
+        const seats = document.createElement('div');
+        seats.className = 'seats flex items-center gap-2 dt';
+        const seatsIconWrap = document.createElement('dt');
+        seatsIconWrap.className = 'flex-shrink-0';
+        const seatsIcon = document.createElement('i');
+        seatsIcon.className = 'fas fa-chair text-gray-400';
+        seatsIcon.setAttribute('aria-hidden', 'true');
+        seatsIconWrap.appendChild(seatsIcon);
+        const seatsCount = document.createElement('dd');
+        seatsCount.className = 'seats-count font-semibold text-gray-800';
+        seatsCount.textContent = typeof schedule.available_seats === 'number' ? schedule.available_seats : '0';
+        const seatsSr = document.createElement('span');
+        seatsSr.className = 'sr-only';
+        seatsSr.textContent = 'seats available';
+        seats.append(seatsIconWrap, seatsCount, seatsSr);
+
+        scheduleMeta.appendChild(seats);
+
+        if (schedule.route?.estimated_duration_minutes) {
+            const duration = document.createElement('div');
+            duration.className = 'duration flex items-center gap-2 justify-end dt';
+            const durationIconWrap = document.createElement('dt');
+            durationIconWrap.className = 'flex-shrink-0';
+            const durationIcon = document.createElement('i');
+            durationIcon.className = 'fas fa-clock text-gray-400';
+            durationIcon.setAttribute('aria-hidden', 'true');
+            durationIconWrap.appendChild(durationIcon);
+            const durationValue = document.createElement('dd');
+            durationValue.textContent = Utils.formatDuration(schedule.route.estimated_duration_minutes);
+            const durationSr = document.createElement('span');
+            durationSr.className = 'sr-only';
+            durationSr.textContent = 'estimated duration';
+            duration.append(durationIconWrap, durationValue, durationSr);
+            scheduleMeta.appendChild(duration);
+        }
+
+        routeInfo.append(header, weatherInfo, scheduleMeta);
+
+        const footer = document.createElement('footer');
+        footer.className = 'schedule-footer pt-4 border-t border-gray-200 px-6 pb-6 bg-gray-50 mt-auto';
+
+        const statusPrice = document.createElement('div');
+        statusPrice.className = 'status-price flex items-center justify-between mb-4';
+
+        const statusConfig = this.getStatusConfig(schedule);
+        const statusBadge = document.createElement('span');
+        statusBadge.className = `status-badge inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-semibold ${statusConfig.badgeClass}`;
+
+        const statusIconEl = document.createElement('i');
+        statusIconEl.className = statusConfig.iconClass;
+        statusIconEl.setAttribute('aria-hidden', 'true');
+
+        const statusLabel = document.createElement('span');
+        statusLabel.setAttribute('aria-label', `Schedule status: ${statusConfig.label}`);
+        statusLabel.textContent = statusConfig.label;
+
+        statusBadge.append(statusIconEl, statusLabel);
+
+        const priceEl = document.createElement('span');
+        if (schedule.bookable && schedule.route?.base_fare) {
+            priceEl.className = 'price text-lg font-bold text-emerald-600';
+            priceEl.setAttribute('aria-label', `Fare: ${Utils.formatPrice(schedule.route.base_fare)}`);
+            priceEl.textContent = Utils.formatPrice(schedule.route.base_fare);
+        } else {
+            priceEl.className = 'price text-sm text-gray-500 font-medium';
+            priceEl.setAttribute('aria-label', 'Booking unavailable');
+            priceEl.textContent = 'Unavailable';
+        }
+
+        statusPrice.append(statusBadge, priceEl);
+
+        const actionButtons = document.createElement('div');
+        actionButtons.className = 'action-buttons space-y-3';
+
+        if (schedule.bookable) {
+            const bookLink = document.createElement('a');
+            bookLink.href = this.getBookingUrl(schedule);
+            bookLink.className = 'book-btn w-full bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-600 hover:to-teal-600 text-white py-3 px-6 rounded-xl font-semibold shadow-lg hover:shadow-xl transition-all transform hover:-translate-y-1 flex items-center justify-center gap-2 text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/50';
+            bookLink.setAttribute('aria-label', `Book ferry from ${schedule.route?.departure || ''} to ${schedule.route?.destination || ''} departing ${schedule.departure_display || ''} (${schedule.available_seats} seats available)`);
+            const bookIcon = document.createElement('i');
+            bookIcon.className = 'fas fa-ticket-alt';
+            bookIcon.setAttribute('aria-hidden', 'true');
+            const bookText = document.createElement('span');
+            bookText.textContent = `Book Now (${schedule.available_seats} seats)`;
+            bookLink.append(bookIcon, bookText);
+            actionButtons.appendChild(bookLink);
+        } else if (schedule.available_seats === 0) {
+            const soldOutBtn = document.createElement('button');
+            soldOutBtn.type = 'button';
+            soldOutBtn.className = 'unavailable-btn w-full bg-gray-300 text-gray-600 py-3 px-6 rounded-xl font-semibold cursor-not-allowed opacity-60 flex items-center justify-center gap-2 disabled';
+            soldOutBtn.disabled = true;
+            soldOutBtn.setAttribute('aria-label', 'This departure is sold out');
+            const soldOutIcon = document.createElement('i');
+            soldOutIcon.className = 'fas fa-chair';
+            soldOutIcon.setAttribute('aria-hidden', 'true');
+            const soldOutText = document.createElement('span');
+            soldOutText.textContent = 'Sold Out';
+            soldOutBtn.append(soldOutIcon, soldOutText);
+            actionButtons.appendChild(soldOutBtn);
+        } else {
+            const statusBtn = document.createElement('button');
+            statusBtn.type = 'button';
+            statusBtn.className = 'cancelled-btn w-full bg-gradient-to-r from-red-500 to-rose-500 text-white py-3 px-6 rounded-xl font-semibold flex items-center justify-center gap-2 disabled';
+            statusBtn.disabled = true;
+            statusBtn.setAttribute('aria-label', `This departure is ${statusConfig.label.toLowerCase()} and cannot be booked`);
+            const statusBtnIcon = document.createElement('i');
+            statusBtnIcon.className = 'fas fa-times-circle';
+            statusBtnIcon.setAttribute('aria-hidden', 'true');
+            const statusBtnText = document.createElement('span');
+            statusBtnText.textContent = statusConfig.label;
+            statusBtn.append(statusBtnIcon, statusBtnText);
+            actionButtons.appendChild(statusBtn);
+        }
+
+        const quickActions = document.createElement('div');
+        quickActions.className = 'quick-actions flex gap-2 justify-center pt-3 bg-white/50 rounded-lg p-2';
+        quickActions.setAttribute('role', 'group');
+        quickActions.setAttribute('aria-label', 'Quick actions for this schedule');
+
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.className = 'quick-btn bg-gray-100 hover:bg-gray-200 text-gray-700 px-3 py-1 rounded-lg text-xs transition-all flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-gray-500/50';
+        saveBtn.setAttribute('aria-label', 'Save this schedule to favorites');
+        saveBtn.addEventListener('click', () => window.saveSchedule?.(schedule.id));
+        const saveIcon = document.createElement('i');
+        saveIcon.className = 'far fa-heart';
+        saveIcon.setAttribute('aria-hidden', 'true');
+        const saveText = document.createElement('span');
+        saveText.className = 'sr-only';
+        saveText.textContent = 'Save';
+        saveBtn.append(saveIcon, saveText);
+
+        const shareBtn = document.createElement('button');
+        shareBtn.type = 'button';
+        shareBtn.className = 'quick-btn bg-blue-100 hover:bg-blue-200 text-blue-700 px-3 py-1 rounded-lg text-xs transition-all flex items-center gap-1 focus:outline-none focus:ring-2 focus:ring-blue-500/50';
+        shareBtn.setAttribute('aria-label', 'Share this schedule');
+        shareBtn.addEventListener('click', () => window.shareSchedule?.(schedule.id));
+        const shareIcon = document.createElement('i');
+        shareIcon.className = 'fas fa-share-alt';
+        shareIcon.setAttribute('aria-hidden', 'true');
+        const shareText = document.createElement('span');
+        shareText.className = 'sr-only';
+        shareText.textContent = 'Share';
+        shareBtn.append(shareIcon, shareText);
+
+        quickActions.append(saveBtn, shareBtn);
+        actionButtons.appendChild(quickActions);
+
+        footer.append(statusPrice, actionButtons);
+        card.append(routeInfo, footer);
+
+        return card;
+    }
+
+    createWeatherMetricElement(type, scheduleId, iconClass, defaultText, ariaLabel) {
+        const span = document.createElement('span');
+        span.className = `weather-${type} inline-flex items-center gap-1`;
+        span.id = `weather-${type}-${scheduleId}`;
+        span.setAttribute('aria-label', ariaLabel);
+
+        const icon = document.createElement('i');
+        icon.className = iconClass;
+        icon.setAttribute('aria-hidden', 'true');
+
+        const value = document.createElement('span');
+        value.textContent = defaultText;
+
+        span.append(icon, value);
+        return span;
+    }
+
+    getStatusConfig(schedule) {
+        const status = (schedule.status || 'scheduled').toLowerCase();
+        const label = schedule.status_display || status.charAt(0).toUpperCase() + status.slice(1);
+        const configs = {
+            scheduled: {
+                badgeClass: 'bg-emerald-100 text-emerald-800',
+                iconClass: 'fas fa-check-circle text-emerald-500',
+                label
+            },
+            delayed: {
+                badgeClass: 'bg-yellow-100 text-yellow-800',
+                iconClass: 'fas fa-exclamation-triangle text-yellow-500',
+                label
+            },
+            cancelled: {
+                badgeClass: 'bg-red-100 text-red-800',
+                iconClass: 'fas fa-times-circle text-red-500',
+                label
+            }
+        };
+
+        return configs[status] || {
+            badgeClass: 'bg-gray-100 text-gray-700',
+            iconClass: 'fas fa-clock text-gray-500',
+            label
+        };
+    }
+
+    getBookingUrl(schedule) {
+        if (schedule.book_url) {
+            return schedule.book_url;
+        }
+
+        const base = window.urls?.bookTicket || '/bookings/book/';
+        const separator = base.includes('?') ? '&' : '?';
+        return `${base}${schedule.id ? `${separator}schedule_id=${encodeURIComponent(schedule.id)}` : ''}`;
+    }
+
+    highlightNewSchedules(ids) {
+        if (!Array.isArray(ids) || ids.length === 0 || !this.scheduleList) {
+            return;
+        }
+
+        ids.forEach(id => {
+            const card = this.scheduleList.querySelector(`[data-schedule-id="${id}"]`);
+            if (!card) return;
+            card.classList.add('ring-2', 'ring-emerald-400', 'shadow-xl');
+            setTimeout(() => {
+                card.classList.remove('ring-2', 'ring-emerald-400', 'shadow-xl');
+            }, 3000);
+        });
+
+        FijiFerry.notificationManager?.show?.('Schedules updated', 'info', 3000);
     }
 
     async updateWeatherDisplay() {
         try {
-            const scheduleCards = Array.from(document.querySelectorAll('.schedule-card'));
+            this.scheduleList = this.scheduleList || this.ensureScheduleList();
+            const scheduleCards = this.scheduleList ? Array.from(this.scheduleList.querySelectorAll('.schedule-card')) : [];
             if (scheduleCards.length === 0) return;
 
-            // === Update each schedule card individually ===
             for (const card of scheduleCards) {
                 const id = card.dataset.scheduleId;
                 if (!id) continue;
 
-                // Fetch weather for this schedule_id
-                const response = await fetch(`/bookings/api/weather/conditions/?schedule_id=${id}`);
+                const weatherUrl = new URL('/bookings/api/weather/conditions/', window.location.origin);
+                weatherUrl.searchParams.set('schedule_id', id);
+                weatherUrl.searchParams.set('_', Date.now().toString());
+
+                const response = await fetch(weatherUrl.toString());
                 if (!response.ok) throw new Error(`Weather fetch failed for schedule ${id}`);
+
                 const { weather } = await response.json();
 
-                // --- Update port weather (for dashboard top icons) ---
                 ['nadi', 'suva'].forEach(port => {
                     const data = weather?.ports?.[port] || {};
                     const iconEl = document.getElementById(`${port}-icon`);
@@ -732,7 +1281,6 @@ class ScheduleManager {
                     if (tempEl) tempEl.textContent = `${data.temp || 28}°`;
                 });
 
-                // --- Update weather details for this schedule card only ---
                 const data = weather || {};
                 ['condition', 'icon', 'temp', 'wind', 'precip'].forEach(field => {
                     const el = document.getElementById(`weather-${field}-${id}`);
@@ -760,7 +1308,6 @@ class ScheduleManager {
         const fallback = Utils.safeParseJSON('weather-data-fallback', {});
         if (!fallback || !fallback.ports) return;
 
-        // Fallback for port weather
         ['nadi', 'suva'].forEach(port => {
             const data = fallback.ports[port] || {};
             const iconEl = document.getElementById(`${port}-icon`);
@@ -769,8 +1316,10 @@ class ScheduleManager {
             if (tempEl) tempEl.textContent = `${data.temp || 28}°`;
         });
 
-        // Fallback for each schedule card
-        document.querySelectorAll('.schedule-card').forEach(card => {
+        const list = this.scheduleList || this.ensureScheduleList();
+        if (!list) return;
+
+        list.querySelectorAll('.schedule-card').forEach(card => {
             const id = card.dataset.scheduleId;
             const data = fallback.current || {};
             ['condition', 'icon', 'temp', 'wind', 'precip'].forEach(field => {
