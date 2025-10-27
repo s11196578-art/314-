@@ -816,6 +816,97 @@ def get_schedule_updates(request):
     return JsonResponse({'schedules': data})
 
 
+@require_GET
+def homepage_schedules_api(request):
+    """Return the latest schedules for the homepage with lightweight metadata."""
+
+    limit = safe_int(request.GET.get('limit', 12)) or 12
+    limit = max(1, min(limit, 30))
+
+    now = timezone.now()
+    base_queryset = (
+        Schedule.objects
+        .filter(departure_time__gte=now, status__in=['scheduled', 'delayed', 'cancelled'])
+        .select_related('ferry', 'route__departure_port', 'route__destination_port')
+        .order_by('departure_time')
+    )
+
+    total_schedules = base_queryset.count()
+    schedules = list(base_queryset[:limit])
+
+    next_departure_schedule = next((s for s in schedules if s.status == 'scheduled' and s.available_seats > 0), None)
+    if not next_departure_schedule:
+        next_departure_schedule = base_queryset.filter(status='scheduled', available_seats__gt=0).first()
+
+    schedule_payload = []
+    hash_source = []
+
+    for schedule in schedules:
+        route = schedule.route
+        departure_local = timezone.localtime(schedule.departure_time)
+
+        try:
+            duration_minutes = int(route.estimated_duration.total_seconds() // 60) if route.estimated_duration else None
+        except (AttributeError, TypeError):
+            duration_minutes = None
+
+        schedule_payload.append({
+            'id': schedule.id,
+            'route': {
+                'id': route.id,
+                'departure': route.departure_port.name,
+                'destination': route.destination_port.name,
+                'base_fare': float(route.base_fare) if route.base_fare is not None else None,
+                'estimated_duration_minutes': duration_minutes,
+            },
+            'ferry_name': schedule.ferry.name if schedule.ferry else '',
+            'departure_time': schedule.departure_time.isoformat(),
+            'departure_display': departure_local.strftime('%a, %b %d, %I:%M %p'),
+            'departure_hour': departure_local.strftime('%H'),
+            'available_seats': schedule.available_seats,
+            'status': schedule.status,
+            'status_display': schedule.get_status_display(),
+            'bookable': schedule.status == 'scheduled' and schedule.available_seats > 0,
+            'book_url': f"{reverse('bookings:book_ticket')}?schedule_id={schedule.id}",
+        })
+
+        hash_source.append({
+            'id': schedule.id,
+            'status': schedule.status,
+            'available_seats': schedule.available_seats,
+            'last_updated': schedule.last_updated.isoformat() if schedule.last_updated else None,
+        })
+
+    remaining = max(total_schedules - len(schedules), 0)
+
+    next_departure_data = None
+    if next_departure_schedule:
+        next_departure_local = timezone.localtime(next_departure_schedule.departure_time)
+        next_departure_data = {
+            'schedule_id': next_departure_schedule.id,
+            'route_display': f"{next_departure_schedule.route.departure_port.name} to {next_departure_schedule.route.destination_port.name}",
+            'time_display': next_departure_local.strftime('%a, %b %d, %I:%M %p'),
+            'departure_time': next_departure_schedule.departure_time.isoformat(),
+            'book_url': f"{reverse('bookings:book_ticket')}?schedule_id={next_departure_schedule.id}",
+        }
+
+    schedules_hash = ''
+    if hash_source:
+        try:
+            hash_payload = json.dumps(hash_source, sort_keys=True)
+            schedules_hash = hashlib.md5(hash_payload.encode('utf-8')).hexdigest()
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logger.warning(f"Failed to compute schedule hash: {exc}")
+
+    return JsonResponse({
+        'schedules': schedule_payload,
+        'total_schedules': total_schedules,
+        'remaining_schedules': remaining,
+        'next_departure': next_departure_data,
+        'schedules_hash': schedules_hash,
+    })
+
+
 @csrf_exempt
 @require_POST
 def get_pricing(request):
